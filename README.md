@@ -1,1 +1,1 @@
-Investa graduation project (simulation). Private deploy repo. Home links to public pages.
+Investa graduation project (simulation). Private deploy repo. Full-viewport app layout.

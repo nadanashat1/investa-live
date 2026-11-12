@@ -1,1 +1,1 @@
-Investa graduation project (simulation). Private deploy repo. Original-home hero restored.
+Investa graduation project (simulation). Private deploy repo. Original-home split hero, photos and avatars restored.

@@ -1,1 +1,1 @@
-Investa graduation project (simulation). Private deploy repo. Hero cards opaque.
+Investa graduation project (simulation). Private deploy repo. Alternating steps, testimonial rows.

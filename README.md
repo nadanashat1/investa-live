@@ -1,1 +1,1 @@
-Investa graduation project (simulation). Private deploy repo. Full-viewport app layout.
+Investa graduation project (simulation). Private deploy repo. Original-home hero restored.

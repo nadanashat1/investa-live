@@ -1,1 +1,1 @@
-Investa graduation project (simulation). Private deploy repo. App shell restored (dashboard, analytics, transactions, product and investor manage, assistant, profile, settings).
+Investa graduation project (simulation). Private deploy repo. Product ROI and finance CRUD, change password.

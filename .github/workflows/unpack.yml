@@ -1,0 +1,17 @@
+name: unpack
+on: workflow_dispatch
+permissions:
+  contents: write
+jobs:
+  unpack:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          tar xzf *investa-deploy.tgz
+          git rm -q *investa-deploy.tgz
+          git config user.name unpack
+          git config user.email unpack@users.noreply.github.com
+          git add -A
+          git commit -m "Unpack deploy bundle"
+          git push

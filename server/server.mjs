@@ -12,12 +12,12 @@ const SCHEMA = `
   CREATE TABLE IF NOT EXISTS sessions(token_hash TEXT PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id), expires INTEGER NOT NULL);
   CREATE TABLE IF NOT EXISTS resets(token_hash TEXT PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id), expires INTEGER NOT NULL, used INTEGER NOT NULL DEFAULT 0);
   CREATE TABLE IF NOT EXISTS startups(id INTEGER PRIMARY KEY, founder_id INTEGER NOT NULL REFERENCES users(id), name TEXT NOT NULL, pitch TEXT NOT NULL DEFAULT '', offered_pct REAL NOT NULL CHECK(offered_pct>0 AND offered_pct<=100));
-  CREATE TABLE IF NOT EXISTS products(id INTEGER PRIMARY KEY, startup_id INTEGER NOT NULL REFERENCES startups(id), name TEXT NOT NULL, price REAL NOT NULL CHECK(price>=0), cost REAL CHECK(cost IS NULL OR cost>=0), available INTEGER NOT NULL DEFAULT 0, sold INTEGER NOT NULL DEFAULT 0);
+  CREATE TABLE IF NOT EXISTS products(id INTEGER PRIMARY KEY, startup_id INTEGER NOT NULL REFERENCES startups(id), name TEXT NOT NULL, price REAL NOT NULL CHECK(price>=0), cost REAL CHECK(cost IS NULL OR cost>=0), available INTEGER NOT NULL DEFAULT 0, sold INTEGER NOT NULL DEFAULT 0, roi REAL);
   CREATE TABLE IF NOT EXISTS interests(id INTEGER PRIMARY KEY, startup_id INTEGER NOT NULL REFERENCES startups(id), investor_id INTEGER NOT NULL REFERENCES users(id), status TEXT NOT NULL CHECK(status IN('pending','accepted','declined')), UNIQUE(startup_id,investor_id));
   CREATE TABLE IF NOT EXISTS messages(id INTEGER PRIMARY KEY, interest_id INTEGER NOT NULL REFERENCES interests(id), sender_id INTEGER NOT NULL REFERENCES users(id), body TEXT NOT NULL, created INTEGER NOT NULL);
   CREATE TABLE IF NOT EXISTS offers(id INTEGER PRIMARY KEY, interest_id INTEGER NOT NULL REFERENCES interests(id), amount REAL NOT NULL CHECK(amount>0), pct REAL NOT NULL CHECK(pct>0 AND pct<=100), status TEXT NOT NULL CHECK(status IN('pending','countered','recorded','declined','withdrawn','expired')), proposed_by TEXT NOT NULL CHECK(proposed_by IN('investor','founder')), parent_id INTEGER, expires INTEGER NOT NULL, created INTEGER NOT NULL);
   CREATE TABLE IF NOT EXISTS agreements(id INTEGER PRIMARY KEY, offer_id INTEGER UNIQUE NOT NULL REFERENCES offers(id), startup_id INTEGER NOT NULL, investor_id INTEGER NOT NULL, amount REAL NOT NULL, pct REAL NOT NULL, created INTEGER NOT NULL);
-  CREATE TABLE IF NOT EXISTS ledger(id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id), kind TEXT NOT NULL CHECK(kind IN('income','expense')), note TEXT NOT NULL, amount REAL NOT NULL CHECK(amount>0), d TEXT NOT NULL);
+  CREATE TABLE IF NOT EXISTS ledger(id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id), kind TEXT NOT NULL CHECK(kind IN('income','expense')), note TEXT NOT NULL, amount REAL NOT NULL CHECK(amount>0), d TEXT NOT NULL, method TEXT, responsible TEXT);
   CREATE TABLE IF NOT EXISTS invoices(id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id), customer TEXT NOT NULL, item TEXT NOT NULL, amount REAL NOT NULL CHECK(amount>0), status TEXT NOT NULL DEFAULT 'Due', d TEXT NOT NULL);
   CREATE TABLE IF NOT EXISTS login_fails(email TEXT PRIMARY KEY, n INTEGER NOT NULL, t INTEGER NOT NULL);
   CREATE TABLE IF NOT EXISTS rate_hits(k TEXT PRIMARY KEY, w INTEGER NOT NULL, n INTEGER NOT NULL);`;
@@ -68,7 +68,7 @@ async function makeDriver(spec) {
 }
 
 export function createApp(dbSpec = ':memory:') {
-  let driver; const ready = (async () => { driver = await makeDriver(dbSpec); await driver.exec(SCHEMA); app.db = driver; })();
+  let driver; const ready = (async () => { driver = await makeDriver(dbSpec); await driver.exec(SCHEMA); for (const ddl of ['ALTER TABLE products ADD COLUMN roi REAL', 'ALTER TABLE ledger ADD COLUMN method TEXT', 'ALTER TABLE ledger ADD COLUMN responsible TEXT']) { try { await driver.run(ddl); } catch { /* column already exists */ } } app.db = driver; })();
   const q = (...a) => driver.q(...a), one = (...a) => driver.one(...a), run = (...a) => driver.run(...a), ins = (...a) => driver.ins(...a), tx = (fn) => driver.tx(fn);
   let serial = true; ready.then(() => { serial = driver.serial; });
   let chain = Promise.resolve(); const withLock = (fn) => { const p = chain.then(fn, fn); chain = p.catch(() => {}); return p; };
@@ -158,8 +158,34 @@ export function createApp(dbSpec = ':memory:') {
   route('POST', '/startups/:id/products', true, async ({ user, params, body }) => {
     await ownStartup(user, params.id);
     const cost = body.cost === undefined || body.cost === null || body.cost === '' ? null : num(body.cost, 'cost');
-    const rid = await ins('INSERT INTO products(startup_id,name,price,cost,available,sold) VALUES(?,?,?,?,?,?)', params.id, str(body.name, 'name'), num(body.price, 'price'), cost, Math.trunc(num(body.available ?? 0, 'available')), Math.trunc(num(body.sold ?? 0, 'sold')));
+    const rid = await ins('INSERT INTO products(startup_id,name,price,cost,available,sold,roi) VALUES(?,?,?,?,?,?,?)', params.id, str(body.name, 'name'), num(body.price, 'price'), cost, Math.trunc(num(body.available ?? 0, 'available')), Math.trunc(num(body.sold ?? 0, 'sold')), optNum(body.roi, 'roi'));
     return [201, productOut(await one('SELECT * FROM products WHERE id=?', rid))];
+  });
+
+  const optNum = (v, k) => (v === undefined || v === null || v === '' ? null : num(v, k));
+  const ownProduct = async (user, id) => { const p = await one('SELECT p.*, s.founder_id FROM products p JOIN startups s ON s.id=p.startup_id WHERE p.id=?', id); if (!p) throw nf('Not found'); if (p.founder_id !== user.id) throw forbid('Not your product'); return p; };
+  route('POST', '/products/:id/update', true, async ({ user, params, body }) => {
+    const p = await ownProduct(user, params.id);
+    for (const k of ['price', 'cost', 'available', 'sold']) if (body[k] !== undefined && body[k] !== null && body[k] !== '' && num(body[k], k) < 0) throw bad(k + ' must be 0 or more');
+    await run('UPDATE products SET name=?, price=?, cost=?, available=?, sold=?, roi=? WHERE id=?', body.name === undefined ? p.name : str(body.name, 'name'), body.price === undefined ? p.price : num(body.price, 'price'), body.cost === undefined ? p.cost : optNum(body.cost, 'cost'), body.available === undefined ? p.available : Math.trunc(num(body.available, 'available')), body.sold === undefined ? p.sold : Math.trunc(num(body.sold, 'sold')), body.roi === undefined ? p.roi : optNum(body.roi, 'roi'), params.id);
+    return productOut(await one('SELECT * FROM products WHERE id=?', params.id));
+  });
+  route('POST', '/products/:id/delete', true, async ({ user, params }) => { await ownProduct(user, params.id); await run('DELETE FROM products WHERE id=?', params.id); return { ok: true }; });
+  route('POST', '/ledger/:id/update', true, async ({ user, params, body }) => {
+    const r = await one('SELECT * FROM ledger WHERE id=? AND user_id=?', params.id, user.id); if (!r) throw nf('Not found');
+    if (body.kind !== undefined && !['income', 'expense'].includes(body.kind)) throw bad('kind must be income or expense');
+    if (body.amount !== undefined && !(num(body.amount, 'amount') > 0)) throw bad('Amount must be above 0');
+    await run('UPDATE ledger SET kind=?, note=?, amount=?, d=?, method=?, responsible=? WHERE id=?', body.kind ?? r.kind, body.note === undefined ? r.note : str(body.note, 'note'), body.amount === undefined ? r.amount : num(body.amount, 'amount'), body.d === undefined ? r.d : str(body.d, 'd', 10), body.method === undefined ? r.method : (String(body.method || '').slice(0, 40) || null), body.responsible === undefined ? r.responsible : (String(body.responsible || '').slice(0, 80) || null), params.id);
+    return await one('SELECT * FROM ledger WHERE id=?', params.id);
+  });
+  route('POST', '/ledger/:id/delete', true, async ({ user, params }) => { const r = await one('SELECT id FROM ledger WHERE id=? AND user_id=?', params.id, user.id); if (!r) throw nf('Not found'); await run('DELETE FROM ledger WHERE id=?', params.id); return { ok: true }; });
+  route('POST', '/auth/change-password', true, async ({ user, token, body }) => {
+    const u = await one('SELECT * FROM users WHERE id=?', user.id);
+    if (typeof body.current !== 'string' || !checkPw(body.current, u.pw)) throw bad('Current password is wrong');
+    if (typeof body.password !== 'string' || body.password.length < 8) throw bad('Password must be at least 8 characters');
+    await run('UPDATE users SET pw=? WHERE id=?', hashPw(body.password), user.id);
+    await run('DELETE FROM sessions WHERE user_id=? AND token_hash<>?', user.id, sha(token));
+    return { ok: true };
   });
   // Derived, honestly named. Not an investment return. Null when cost is missing or zero.
   const productOut = (p) => ({ ...p, gross_sales: p.price * p.sold, markup_on_unit_cost_pct: p.cost > 0 ? ((p.price - p.cost) / p.cost) * 100 : null });
@@ -242,7 +268,7 @@ export function createApp(dbSpec = ':memory:') {
   route('GET', '/ledger', true, async ({ user }) => await q('SELECT * FROM ledger WHERE user_id=? ORDER BY id DESC', user.id));
   route('POST', '/ledger', true, async ({ user, body }) => {
     if (!['income', 'expense'].includes(body.kind)) throw bad('kind must be income or expense');
-    const rid = await ins('INSERT INTO ledger(user_id,kind,note,amount,d) VALUES(?,?,?,?,?)', user.id, body.kind, str(body.note, 'note'), num(body.amount, 'amount'), str(body.d, 'd', 10));
+    const rid = await ins('INSERT INTO ledger(user_id,kind,note,amount,d,method,responsible) VALUES(?,?,?,?,?,?,?)', user.id, body.kind, str(body.note, 'note'), num(body.amount, 'amount'), str(body.d, 'd', 10), String(body.method || '').slice(0, 40) || null, String(body.responsible || '').slice(0, 80) || null);
     return [201, await one('SELECT * FROM ledger WHERE id=?', rid)];
   });
   route('GET', '/ledger/summary', true, async ({ user }) => { const r = await one("SELECT COALESCE(SUM(CASE WHEN kind='income' THEN amount END),0) income, COALESCE(SUM(CASE WHEN kind='expense' THEN amount END),0) expense FROM ledger WHERE user_id=?", user.id); return { ...r, net: r.income - r.expense }; });
